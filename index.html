@@ -67,8 +67,8 @@
         mesh: './media/models/sponza/sponza-ktx.glb',
         renderLightSprites: true,
         lightPattern: 'wandering',
-        lightCount: 128,
-        maxLightRange: 2,
+        lightCount: 12,
+        maxLightRange: 5,
       };
 
       const meshPaths = {
@@ -160,6 +160,11 @@
             renderer.lightManager.render = appSettings.renderLightSprites;
 
             onOutputChange();
+
+            // Check for WebXR support and add VR button
+            if (renderer.checkXRSupport) {
+              renderer.checkXRSupport(gui);
+            }
 
             renderer.start();
           } catch (err) {

@@ -26,7 +26,7 @@ import { ProjectionUniformsSize, ViewUniformsSize, BIND_GROUP } from './shaders/
 import { PBRRenderBundleHelper, PBRClusteredRenderBundleHelper } from './pbr-render-bundle-helper.js';
 import { DepthVisualization, DepthSliceVisualization, ClusterDistanceVisualization, LightsPerClusterVisualization } from './debug-visualizations.js';
 import { LightSpriteVertexSource, LightSpriteFragmentSource } from './shaders/light-sprite.js';
-import { vec2, vec3, vec4 } from '../third-party/gl-matrix/dist/esm/index.js';
+import { vec2, vec3, vec4, mat4 } from '../third-party/gl-matrix/dist/esm/index.js';
 import { WebGPUTextureLoader } from '../third-party/web-texture-tool/build/webgpu-texture-loader.js';
 
 import { ClusterBoundsSource, ClusterLightsSource, DISPATCH_SIZE, TOTAL_TILES, CLUSTER_LIGHTS_SIZE } from './shaders/clustered-compute.js';
@@ -56,13 +56,56 @@ export class WebGPURenderer extends Renderer {
       'cluster-distance': ClusterDistanceVisualization,
       'lights-per-cluster': LightsPerClusterVisualization,
     };
+
+    // WebXR state
+    this.xrSession = null;
+    this.xrBinding = null;
+    this.xrLayer = null;
+    this.xrRefSpace = null;
+    this.xrBaseRefSpace = null;
+    this.xrDepthTextures = [];
+    this.xrViewBuffers = [];
+    this.xrPrevTime = 0;
+
+    // Light selection state
+    this.selectedLightIndex = -1;
+    this.releasingLightIndex = -1; // For color lerp back
+    this.wasTransientPointerActive = false;
+    this.selectionStartDistance = 0; // XZ distance from ray origin to light
+    this.selectionStartRayDirY = 0; // Ray Y direction at selection start
+    this.selectionStartLightY = 0; // Light Y at selection start
+    this.originalLightColor = vec3.create();
+    this.releasingLightColor = vec3.create();
+    this.colorAmplify = 1.0; // Amplification factor during selection
+
+    // Two-handed color control
+    this.secondHandActive = false;
+    this.secondHandStartX = 0;
+    this.colorRamp = [
+      vec3.fromValues(1, 0.2, 0.2),   // Red
+      vec3.fromValues(1, 0.5, 0.1),   // Orange
+      vec3.fromValues(1, 1, 0.2),     // Yellow
+      vec3.fromValues(0.2, 1, 0.2),   // Green
+      vec3.fromValues(0.2, 0.8, 1),   // Cyan
+      vec3.fromValues(0.3, 0.3, 1),   // Blue
+      vec3.fromValues(0.8, 0.2, 1),   // Purple
+      vec3.fromValues(1, 0.4, 0.8),   // Pink
+    ];
+
+    // Teleportation state
+    this.teleportTarget = null;
+    this.teleportStartPos = null;
+    this.teleportStartRayOrigin = null;
+    this.playerOffset = vec3.fromValues(0, 0, 0);
+    this.isTeleporting = false; // true = teleport mode, false = light mode
   }
 
   async init() {
     this.outputRenderBundles = {};
 
     this.adapter = await navigator.gpu.requestAdapter({
-      powerPreference: "high-performance"
+      powerPreference: "high-performance",
+      xrCompatible: true
     });
 
     // Enable compressed textures if available
@@ -98,6 +141,13 @@ export class WebGPURenderer extends Renderer {
       colorFormats: [ this.contextFormat ],
       depthStencilFormat: DEPTH_FORMAT,
       sampleCount: SAMPLE_COUNT
+    };
+
+    // XR render bundle descriptor (no MSAA)
+    this.xrRenderBundleDescriptor = {
+      colorFormats: [ this.contextFormat ],
+      depthStencilFormat: DEPTH_FORMAT,
+      sampleCount: 1
     };
 
     // Just for debugging my shader helper stuff. This is expected to fail.
@@ -235,6 +285,21 @@ export class WebGPURenderer extends Renderer {
       usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.UNIFORM,
     });
 
+    // Per-eye view buffers for XR stereo rendering
+    this.xrViewBuffers = [
+      this.device.createBuffer({ size: ViewUniformsSize, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.UNIFORM }),
+      this.device.createBuffer({ size: ViewUniformsSize, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.UNIFORM }),
+    ];
+    this.xrViewData = new Float32Array(ViewUniformsSize / 4);
+
+    // Per-eye projection buffers for XR (projection matrices differ per eye)
+    this.xrProjectionBuffers = [
+      this.device.createBuffer({ size: ProjectionUniformsSize, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.UNIFORM }),
+      this.device.createBuffer({ size: ProjectionUniformsSize, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.UNIFORM }),
+    ];
+    this.xrProjectionData = new Float32Array(ProjectionUniformsSize / 4);
+    this.xrInverseProjection = mat4.create();
+
     this.lightsBuffer = this.device.createBuffer({
       size: this.lightManager.uniformArray.byteLength,
       usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.STORAGE,
@@ -270,32 +335,54 @@ export class WebGPURenderer extends Renderer {
           }
         }],
       })
-    }
+    };
+
+    // Per-eye frame bind groups for XR stereo rendering
+    this.xrFrameBindGroups = this.xrViewBuffers.map((viewBuffer, i) =>
+      this.device.createBindGroup({
+        layout: this.bindGroupLayouts.frame,
+        entries: [{
+          binding: 0,
+          resource: { buffer: this.xrProjectionBuffers[i] },
+        }, {
+          binding: 1,
+          resource: { buffer: viewBuffer },
+        }, {
+          binding: 2,
+          resource: { buffer: this.lightsBuffer },
+        }, {
+          binding: 3,
+          resource: { buffer: this.clusterLightsBuffer }
+        }],
+      })
+    );
 
     this.blackTextureView = this.textureLoader.fromColor(0, 0, 0, 0).texture.createView();
     this.whiteTextureView = this.textureLoader.fromColor(1.0, 1.0, 1.0, 1.0).texture.createView();
     this.blueTextureView = this.textureLoader.fromColor(0, 0, 1.0, 0).texture.createView();
 
     // Setup a render pipeline for drawing the light sprites
+    const lightSpriteVertexModule = this.device.createShaderModule({
+      code: LightSpriteVertexSource,
+      label: 'Light Sprite'
+    });
+    const lightSpriteFragmentModule = this.device.createShaderModule({
+      code: LightSpriteFragmentSource,
+      label: 'Light Sprite'
+    });
+    const lightSpritePipelineLayout = this.device.createPipelineLayout({
+      bindGroupLayouts: [this.bindGroupLayouts.frame]
+    });
+
     this.lightSpritePipeline = this.device.createRenderPipeline({
       label: `light-sprite-pipeline`,
-      layout: this.device.createPipelineLayout({
-        bindGroupLayouts: [
-          this.bindGroupLayouts.frame, // set 0
-        ]
-      }),
+      layout: lightSpritePipelineLayout,
       vertex: {
-        module: this.device.createShaderModule({
-          code: LightSpriteVertexSource,
-          label: 'Light Sprite'
-        }),
+        module: lightSpriteVertexModule,
         entryPoint: 'vertexMain'
       },
       fragment: {
-        module: this.device.createShaderModule({
-          code: LightSpriteFragmentSource,
-          label: 'Light Sprite'
-        }),
+        module: lightSpriteFragmentModule,
         entryPoint: 'fragmentMain',
         targets: [{
           format: this.contextFormat,
@@ -322,6 +409,152 @@ export class WebGPURenderer extends Renderer {
       },
       multisample: {
         count: SAMPLE_COUNT,
+      }
+    });
+
+    // Teleport reticle pipeline (XR only, no MSAA)
+    const reticleShaderModule = this.device.createShaderModule({
+      label: 'Teleport Reticle',
+      code: `
+        struct Uniforms {
+          viewProj: mat4x4<f32>,
+          position: vec3<f32>,
+          radius: f32,
+        };
+        @group(0) @binding(0) var<uniform> uniforms: Uniforms;
+
+        struct VertexOutput {
+          @builtin(position) position: vec4<f32>,
+          @location(0) uv: vec2<f32>,
+        };
+
+        @vertex
+        fn vertexMain(@builtin(vertex_index) idx: u32) -> VertexOutput {
+          var pos = array<vec2<f32>, 4>(
+            vec2<f32>(-1.0, -1.0),
+            vec2<f32>(1.0, -1.0),
+            vec2<f32>(-1.0, 1.0),
+            vec2<f32>(1.0, 1.0)
+          );
+          var output: VertexOutput;
+          output.uv = pos[idx];
+          let worldPos = vec3<f32>(
+            uniforms.position.x + pos[idx].x * uniforms.radius,
+            uniforms.position.y + 0.01,
+            uniforms.position.z + pos[idx].y * uniforms.radius
+          );
+          output.position = uniforms.viewProj * vec4<f32>(worldPos, 1.0);
+          return output;
+        }
+
+        @fragment
+        fn fragmentMain(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
+          let dist = length(uv);
+          let ring = smoothstep(0.7, 0.75, dist) * (1.0 - smoothstep(0.85, 0.9, dist));
+          let center = 1.0 - smoothstep(0.0, 0.15, dist);
+          let alpha = (ring + center * 0.5) * 0.8;
+          if (alpha < 0.01) { discard; }
+          return vec4<f32>(0.2, 0.8, 1.0, alpha);
+        }
+      `
+    });
+
+    this.reticleBindGroupLayout = this.device.createBindGroupLayout({
+      entries: [{
+        binding: 0,
+        visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT,
+        buffer: {}
+      }]
+    });
+
+    // Per-eye reticle buffers (to avoid writeBuffer timing issues in stereo)
+    this.reticleUniformBuffers = [];
+    this.reticleBindGroups = [];
+    for (let i = 0; i < 2; i++) {
+      const buffer = this.device.createBuffer({
+        size: 80, // mat4 + vec3 + f32
+        usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
+      });
+      this.reticleUniformBuffers.push(buffer);
+      this.reticleBindGroups.push(this.device.createBindGroup({
+        layout: this.reticleBindGroupLayout,
+        entries: [{
+          binding: 0,
+          resource: { buffer }
+        }]
+      }));
+    }
+
+    this.reticlePipeline = this.device.createRenderPipeline({
+      label: 'reticle-pipeline',
+      layout: this.device.createPipelineLayout({
+        bindGroupLayouts: [this.reticleBindGroupLayout]
+      }),
+      vertex: {
+        module: reticleShaderModule,
+        entryPoint: 'vertexMain'
+      },
+      fragment: {
+        module: reticleShaderModule,
+        entryPoint: 'fragmentMain',
+        targets: [{
+          format: this.contextFormat,
+          blend: {
+            color: { srcFactor: 'src-alpha', dstFactor: 'one-minus-src-alpha' },
+            alpha: { srcFactor: 'one', dstFactor: 'one' }
+          }
+        }]
+      },
+      primitive: {
+        topology: 'triangle-strip',
+        stripIndexFormat: 'uint32'
+      },
+      depthStencil: {
+        depthWriteEnabled: false,
+        depthCompare: 'less',
+        format: DEPTH_FORMAT,
+      },
+      multisample: { count: 1 }
+    });
+
+    this.reticleUniformData = new Float32Array(20); // mat4 + vec3 + f32
+
+    // XR light sprite pipeline (no MSAA)
+    this.xrLightSpritePipeline = this.device.createRenderPipeline({
+      label: `xr-light-sprite-pipeline`,
+      layout: lightSpritePipelineLayout,
+      vertex: {
+        module: lightSpriteVertexModule,
+        entryPoint: 'vertexMain'
+      },
+      fragment: {
+        module: lightSpriteFragmentModule,
+        entryPoint: 'fragmentMain',
+        targets: [{
+          format: this.contextFormat,
+          blend: {
+            color: {
+              srcFactor: 'src-alpha',
+              dstFactor: 'one',
+            },
+            alpha: {
+              srcFactor: "one",
+              dstFactor: "one",
+            },
+          },
+        }],
+      },
+      primitive: {
+        topology: 'triangle-strip',
+        stripIndexFormat: 'uint32'
+      },
+      depthStencil: {
+        depthWriteEnabled: false,
+        depthCompare: 'less',
+        format: DEPTH_FORMAT,
+      },
+      multisample: {
+        count: 1,
       }
     });
   }
@@ -377,6 +610,7 @@ export class WebGPURenderer extends Renderer {
     }
 
     this.outputRenderBundles = {};
+    this.xrRenderBundles = {};
     this.primitives = gltf.primitives;
   }
 
@@ -658,5 +892,443 @@ export class WebGPURenderer extends Renderer {
 
     passEncoder.end();
     this.device.queue.submit([commandEncoder.finish()]);
+  }
+
+  async checkXRSupport(gui) {
+    const vrFolder = gui.addFolder('WebXR');
+    vrFolder.add({ enterVR: () => this.startXRSession() }, 'enterVR').name('Enter VR');
+
+    if (!('xr' in navigator)) {
+      console.warn('WebXR: navigator.xr not available');
+    } else if (!('XRGPUBinding' in window)) {
+      console.warn('WebXR: XRGPUBinding not available (WebGPU+WebXR integration not supported)');
+    } else {
+      try {
+        const vrSupported = await navigator.xr.isSessionSupported('immersive-vr');
+        console.log('WebXR: immersive-vr supported =', vrSupported);
+      } catch (err) {
+        console.error('WebXR: Error checking session support:', err);
+      }
+    }
+  }
+
+  async startXRSession() {
+    if (this.xrSession) {
+      this.xrSession.end();
+      return;
+    }
+
+    try {
+      this.xrSession = await navigator.xr.requestSession('immersive-vr', {
+        requiredFeatures: ['webgpu', 'local-floor'],
+        optionalFeatures: ['transient-pointer'],
+      });
+
+      this.xrBinding = new XRGPUBinding(this.xrSession, this.device);
+
+      this.xrLayer = this.xrBinding.createProjectionLayer({
+        colorFormat: this.contextFormat,
+        scaleFactor: 1.0,
+      });
+
+      this.xrSession.updateRenderState({ layers: [this.xrLayer] });
+
+      this.xrBaseRefSpace = await this.xrSession.requestReferenceSpace('local-floor');
+      // Apply player offset (for teleportation)
+      this.updateXRRefSpace();
+
+      this.xrSession.addEventListener('end', () => this.onXRSessionEnd());
+      this.xrPrevTime = performance.now();
+      this.xrSession.requestAnimationFrame((time, frame) => this.xrFrameCallback(time, frame));
+
+      console.log('XR session started');
+    } catch (err) {
+      console.error('Failed to start XR session:', err);
+    }
+  }
+
+  onXRSessionEnd() {
+    this.xrSession = null;
+    this.xrBinding = null;
+    this.xrLayer = null;
+    this.xrRefSpace = null;
+    this.xrBaseRefSpace = null;
+    for (const tex of this.xrDepthTextures) tex.destroy();
+    this.xrDepthTextures = [];
+    this.selectedLightIndex = -1;
+    this.releasingLightIndex = -1;
+    this.teleportTarget = null;
+    this.isTeleporting = false;
+    this.rafId = requestAnimationFrame(this.frameCallback);
+  }
+
+  updateXRRefSpace() {
+    if (!this.xrBaseRefSpace) return;
+    const offset = new XRRigidTransform({
+      x: -this.playerOffset[0],
+      y: -this.playerOffset[1] - 1.0, // -1.0 to spawn at reasonable height
+      z: -this.playerOffset[2]
+    });
+    this.xrRefSpace = this.xrBaseRefSpace.getOffsetReferenceSpace(offset);
+  }
+
+  getXRDepthTexture(index, width, height) {
+    const existing = this.xrDepthTextures[index];
+    if (existing && existing.width === width && existing.height === height) {
+      return existing;
+    }
+    if (existing) existing.destroy();
+    this.xrDepthTextures[index] = this.device.createTexture({
+      size: [width, height],
+      format: DEPTH_FORMAT,
+      usage: GPUTextureUsage.RENDER_ATTACHMENT,
+    });
+    return this.xrDepthTextures[index];
+  }
+
+  xrFrameCallback(time, frame) {
+    if (!this.xrSession || !this.xrRefSpace || !this.xrBinding || !this.xrLayer) return;
+
+    this.xrSession.requestAnimationFrame((t, f) => this.xrFrameCallback(t, f));
+
+    const pose = frame.getViewerPose(this.xrRefSpace);
+    if (!pose) return;
+
+    const timeDelta = time - this.xrPrevTime;
+    this.xrPrevTime = time;
+
+    // Handle transient-pointer for light selection (using gaze ray)
+    this.handleTransientPointer(frame, pose);
+
+    // Update wandering lights (skip selected light)
+    switch (this.lightPattern) {
+      case 'wandering':
+        this.updateWanderingLights(timeDelta, this.selectedLightIndex);
+        break;
+    }
+
+    // Update light buffer
+    this.device.queue.writeBuffer(this.lightsBuffer, 0, this.lightManager.uniformArray);
+
+    // Write per-eye uniforms BEFORE render passes
+    const subImages = [];
+    for (let i = 0; i < pose.views.length; i++) {
+      const view = pose.views[i];
+      subImages[i] = this.xrBinding.getViewSubImage(this.xrLayer, view);
+
+      // Projection uniforms for this eye
+      const proj = view.projectionMatrix;
+      mat4.invert(this.xrInverseProjection, proj);
+      this.xrProjectionData.set(proj, 0);
+      this.xrProjectionData.set(this.xrInverseProjection, 16);
+      // outputSize
+      const vp = subImages[i].viewport;
+      this.xrProjectionData[32] = vp.width;
+      this.xrProjectionData[33] = vp.height;
+      // zNear, zFar (extract from projection matrix)
+      this.xrProjectionData[34] = this.zRange[0];
+      this.xrProjectionData[35] = this.zRange[1];
+      this.device.queue.writeBuffer(this.xrProjectionBuffers[i], 0, this.xrProjectionData);
+
+      // View matrix and camera position for this eye
+      const viewMatrix = view.transform.inverse.matrix;
+      this.xrViewData.set(viewMatrix, 0);
+      this.xrViewData[16] = view.transform.position.x;
+      this.xrViewData[17] = view.transform.position.y;
+      this.xrViewData[18] = view.transform.position.z;
+      this.device.queue.writeBuffer(this.xrViewBuffers[i], 0, this.xrViewData);
+
+      // Reticle uniforms for this eye (write BEFORE command encoder)
+      if (this.teleportTarget) {
+        const viewProjMatrix = mat4.multiply(mat4.create(), view.projectionMatrix, view.transform.inverse.matrix);
+        this.reticleUniformData.set(viewProjMatrix, 0);
+        this.reticleUniformData[16] = this.teleportTarget[0];
+        this.reticleUniformData[17] = this.teleportTarget[1];
+        this.reticleUniformData[18] = this.teleportTarget[2];
+        this.reticleUniformData[19] = 0.5; // radius
+        this.device.queue.writeBuffer(this.reticleUniformBuffers[i], 0, this.reticleUniformData);
+      }
+    }
+
+    const commandEncoder = this.device.createCommandEncoder();
+
+    // Render each eye (using naive-forward, no cluster computation needed)
+    for (let i = 0; i < pose.views.length; i++) {
+      const subImage = subImages[i];
+
+      const colorView = subImage.colorTexture.createView(
+        subImage.getViewDescriptor?.() ?? {}
+      );
+      const depthTex = this.getXRDepthTexture(i, subImage.colorTexture.width, subImage.colorTexture.height);
+
+      const passEncoder = commandEncoder.beginRenderPass({
+        colorAttachments: [{
+          view: colorView,
+          clearValue: { r: 0.0, g: 0.0, b: 0.5, a: 1.0 },
+          loadOp: 'clear',
+          storeOp: 'store',
+        }],
+        depthStencilAttachment: {
+          view: depthTex.createView(),
+          depthClearValue: 1.0,
+          depthLoadOp: 'clear',
+          depthStoreOp: 'store',
+        }
+      });
+
+      const vp = subImage.viewport;
+      passEncoder.setViewport(vp.x, vp.y, vp.width, vp.height, 0.0, 1.0);
+
+      // Render scene with per-eye bind group
+      this.renderXREye(passEncoder, i);
+
+      passEncoder.end();
+    }
+
+    this.device.queue.submit([commandEncoder.finish()]);
+  }
+
+  renderXREye(passEncoder, eyeIndex) {
+    // Force naive-forward in XR (clustered has view-space mismatch issues)
+    const xrOutputType = 'naive-forward';
+
+    // Create per-eye render bundles if needed
+    if (!this.xrRenderBundles) {
+      this.xrRenderBundles = {};
+    }
+    const bundleKey = `${xrOutputType}_eye${eyeIndex}`;
+    let renderBundle = this.xrRenderBundles[bundleKey];
+
+    if (!renderBundle && this.primitives) {
+      const helperConstructor = this.outputHelpers[xrOutputType];
+      // Temporarily override settings for XR bundle creation
+      const originalFrameBindGroup = this.bindGroups.frame;
+      const originalDescriptor = this.renderBundleDescriptor;
+      this.bindGroups.frame = this.xrFrameBindGroups[eyeIndex];
+      this.renderBundleDescriptor = this.xrRenderBundleDescriptor;
+
+      const renderBundleHelper = new helperConstructor(this);
+      renderBundle = this.xrRenderBundles[bundleKey] = renderBundleHelper.createRenderBundle(this.primitives);
+
+      this.bindGroups.frame = originalFrameBindGroup;
+      this.renderBundleDescriptor = originalDescriptor;
+    }
+
+    if (renderBundle) {
+      passEncoder.executeBundles([renderBundle]);
+    }
+
+    if (this.lightManager.render) {
+      passEncoder.setPipeline(this.xrLightSpritePipeline);
+      passEncoder.setBindGroup(BIND_GROUP.Frame, this.xrFrameBindGroups[eyeIndex]);
+      passEncoder.draw(4, this.lightManager.lightCount, 0, 0);
+    }
+
+    // Draw teleport reticle if teleporting (uniforms already written per-eye)
+    if (this.teleportTarget) {
+      passEncoder.setPipeline(this.reticlePipeline);
+      passEncoder.setBindGroup(0, this.reticleBindGroups[eyeIndex]);
+      passEncoder.draw(4);
+    }
+  }
+
+  handleTransientPointer(frame, viewerPose) {
+    if (!this.xrSession || !viewerPose) return;
+
+    // Lerp releasing light color back to original
+    if (this.releasingLightIndex >= 0) {
+      const light = this.lightManager.lights[this.releasingLightIndex];
+      vec3.lerp(light.color, light.color, this.releasingLightColor, 0.08);
+      const diff = Math.abs(light.color[0] - this.releasingLightColor[0]) +
+                   Math.abs(light.color[1] - this.releasingLightColor[1]) +
+                   Math.abs(light.color[2] - this.releasingLightColor[2]);
+      if (diff < 0.01) {
+        vec3.copy(light.color, this.releasingLightColor);
+        this.releasingLightIndex = -1;
+      }
+    }
+
+    // Collect all transient pointers with their rays
+    const transientPointers = [];
+    for (const input of this.xrSession.inputSources) {
+      if (input.targetRayMode === 'transient-pointer') {
+        const pose = frame.getPose(input.targetRaySpace, this.xrRefSpace);
+        if (pose) {
+          // Extract ray from transient pointer pose (this IS the gaze ray on Vision Pro)
+          const origin = [
+            pose.transform.position.x,
+            pose.transform.position.y,
+            pose.transform.position.z
+          ];
+          // Get ray direction from orientation quaternion
+          const q = pose.transform.orientation;
+          const qx = q.x, qy = q.y, qz = q.z, qw = q.w;
+          const ix = -qy, iy = qx, iz = -qw, iw = qz;
+          const dir = [
+            ix * qw + iw * -qx + iy * -qz - iz * -qy,
+            iy * qw + iw * -qy + iz * -qx - ix * -qz,
+            iz * qw + iw * -qz + ix * -qy - iy * -qx
+          ];
+          transientPointers.push({ input, pose, origin, dir });
+        }
+      }
+    }
+
+    const primaryActive = transientPointers.length > 0;
+    const secondaryActive = transientPointers.length > 1;
+
+    // Use transient pointer ray for targeting (NOT viewer pose)
+    let gazeOrigin = null;
+    let gazeDir = null;
+    if (primaryActive) {
+      gazeOrigin = transientPointers[0].origin;
+      gazeDir = transientPointers[0].dir;
+    }
+
+    // Test gaze ray against lights (only if we have a transient pointer)
+    let closestLightDist = Infinity;
+    let closestLightIdx = -1;
+    let groundHitT = Infinity;
+    let groundHitPos = null;
+
+    if (gazeOrigin && gazeDir) {
+      // Proper ray-sphere intersection (quadratic formula)
+      const hitRadius = 0.5; // Visual sprite hit radius (not light.range!)
+      
+      for (let i = 4; i < this.lightManager.lightCount; i++) {
+        const light = this.lightManager.lights[i];
+        // offset = origin - center
+        const ox = gazeOrigin[0] - light.position[0];
+        const oy = gazeOrigin[1] - light.position[1];
+        const oz = gazeOrigin[2] - light.position[2];
+        
+        // a = ray . ray (should be 1 if normalized, but compute anyway)
+        const a = gazeDir[0] * gazeDir[0] + gazeDir[1] * gazeDir[1] + gazeDir[2] * gazeDir[2];
+        // b = 2 * ray . offset
+        const b = 2 * (gazeDir[0] * ox + gazeDir[1] * oy + gazeDir[2] * oz);
+        // c = offset . offset - radius^2
+        const c = ox * ox + oy * oy + oz * oz - hitRadius * hitRadius;
+        
+        const discriminant = b * b - 4 * a * c;
+        if (discriminant > 0) {
+          const t = (-b - Math.sqrt(discriminant)) / (2 * a);
+          if (t > 0 && t < closestLightDist) {
+            closestLightDist = t;
+            closestLightIdx = i;
+          }
+        }
+      }
+
+      // Test gaze ray against ground
+      if (gazeDir[1] < -0.01) {
+        const t = -gazeOrigin[1] / gazeDir[1];
+        if (t > 0 && t < 100) {
+          groundHitT = t;
+          groundHitPos = [gazeOrigin[0] + gazeDir[0] * t, 0, gazeOrigin[2] + gazeDir[2] * t];
+        }
+      }
+    }
+
+    if (primaryActive) {
+      const rayOrigin = transientPointers[0].origin;
+      const rayDir = transientPointers[0].dir;
+      const handPos = transientPointers[0].pose.transform.position;
+
+      if (!this.wasTransientPointerActive) {
+        // Pinch start
+        if (closestLightIdx >= 0 && closestLightDist < groundHitT) {
+          // Light mode
+          this.isTeleporting = false;
+          if (this.releasingLightIndex === closestLightIdx) this.releasingLightIndex = -1;
+          this.selectedLightIndex = closestLightIdx;
+          const light = this.lightManager.lights[closestLightIdx];
+          vec3.copy(this.originalLightColor, light.color);
+          this.selectionStartLightY = light.position[1];
+          this.selectionStartRayDirY = rayDir[1];
+          // Capture XZ distance from ray origin to light
+          const dx = light.position[0] - rayOrigin[0];
+          const dz = light.position[2] - rayOrigin[2];
+          this.selectionStartDistance = Math.sqrt(dx * dx + dz * dz);
+          this.colorAmplify = 1.0;
+          this.secondHandActive = false;
+        } else if (groundHitPos) {
+          // Teleport mode
+          this.isTeleporting = true;
+          this.teleportTarget = [...groundHitPos];
+          this.teleportStartPos = [...groundHitPos];
+          this.teleportStartRayOrigin = [...rayOrigin];
+        }
+      } else if (this.isTeleporting && this.teleportTarget) {
+        // Teleport: adjust target based on ray origin movement
+        const multiplier = 10.0;
+        this.teleportTarget[0] = this.teleportStartPos[0] + (rayOrigin[0] - this.teleportStartRayOrigin[0]) * multiplier;
+        this.teleportTarget[2] = this.teleportStartPos[2] + (rayOrigin[2] - this.teleportStartRayOrigin[2]) * multiplier;
+      } else if (!this.isTeleporting && this.selectedLightIndex >= 0) {
+        // Light movement (webgpu-water style)
+        const light = this.lightManager.lights[this.selectedLightIndex];
+
+        // XZ: horizontal ray direction at fixed distance from ray origin
+        const flatDirX = rayDir[0];
+        const flatDirZ = rayDir[2];
+        const flatLen = Math.sqrt(flatDirX * flatDirX + flatDirZ * flatDirZ);
+        if (flatLen > 0.001) {
+          const normX = flatDirX / flatLen;
+          const normZ = flatDirZ / flatLen;
+          light.position[0] = rayOrigin[0] + normX * this.selectionStartDistance;
+          light.position[2] = rayOrigin[2] + normZ * this.selectionStartDistance;
+        }
+
+        // Y: arm pivot (ray direction Y delta)
+        const rayDirYDelta = (rayDir[1] - this.selectionStartRayDirY) * 5.0;
+        light.position[1] = Math.max(0.2, this.selectionStartLightY + rayDirYDelta);
+
+        // Amplify color while selected
+        this.colorAmplify = Math.min(this.colorAmplify + 0.05, 2.0);
+        vec3.scale(light.color, this.originalLightColor, this.colorAmplify);
+
+        // Two-handed color control
+        if (secondaryActive) {
+          const secondHand = transientPointers[1].pose.transform.position;
+          if (!this.secondHandActive) {
+            this.secondHandActive = true;
+            this.secondHandStartX = secondHand.x;
+          }
+          // Map hand X movement to color ramp
+          const delta = (secondHand.x - this.secondHandStartX) * 5.0;
+          const t = Math.max(0, Math.min(1, (delta + 1) / 2)); // -1 to 1 -> 0 to 1
+          const rampIdx = t * (this.colorRamp.length - 1);
+          const idx0 = Math.floor(rampIdx);
+          const idx1 = Math.min(idx0 + 1, this.colorRamp.length - 1);
+          const blend = rampIdx - idx0;
+          vec3.lerp(this.originalLightColor, this.colorRamp[idx0], this.colorRamp[idx1], blend);
+          vec3.scale(light.color, this.originalLightColor, this.colorAmplify);
+        } else {
+          this.secondHandActive = false;
+        }
+      }
+    } else if (this.wasTransientPointerActive) {
+      // Release
+      if (this.isTeleporting && this.teleportTarget) {
+        // SET the offset to teleport target (not add!)
+        this.playerOffset[0] = this.teleportTarget[0];
+        this.playerOffset[2] = this.teleportTarget[2];
+        this.updateXRRefSpace();
+        this.teleportTarget = null;
+        this.teleportStartPos = null;
+        this.teleportStartRayOrigin = null;
+        this.isTeleporting = false;
+      } else if (this.selectedLightIndex >= 0) {
+        this.releasingLightIndex = this.selectedLightIndex;
+        vec3.copy(this.releasingLightColor, this.originalLightColor);
+        this.selectedLightIndex = -1;
+        this.secondHandActive = false;
+      }
+    }
+
+    this.wasTransientPointerActive = primaryActive;
+  }
+
+  getTeleportTarget() {
+    return this.teleportTarget;
   }
 }

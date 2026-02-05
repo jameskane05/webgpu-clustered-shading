@@ -1,0 +1,15 @@
+{
+  "name": "webgpu-clustered-shading",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-basic-ssl": "^2.1.4",
+    "vite": "^7.2.4"
+  }
+}

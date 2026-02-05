@@ -85,6 +85,9 @@ export class Renderer {
 
     this.lightPattern = 'wandering';
 
+    // WebXR state (overridden in WebGPURenderer)
+    this.xrSession = null;
+
     // Storage for global uniforms.
     // These can either be used individually or as a uniform buffer.
     this.frameUniforms = new Float32Array(16 + 16 + 16 + 4 + 4);
@@ -138,25 +141,26 @@ export class Renderer {
     for (let i = 5; i < this.lightManager.maxLightCount; ++i) {
       light = this.lightManager.lights[i];
 
-      // Sponza scene approximate bounds:
-      // X [-11, 10]
-      // Y [0.2, 6.5]
-      // Z [-4.5, 4.0]
-      light.position[0] = randomBetween(-11, 10);
-      light.position[1] = randomBetween(0.2, 6.5);
-      light.position[2] = randomBetween(-4.5, 4.0);
+      // Tighter bounds - stay within main sponza area, above floor
+      light.position[0] = randomBetween(-5, 5);
+      light.position[1] = randomBetween(1.0, 4.0);
+      light.position[2] = randomBetween(-1.5, 1.5);
 
-      light.range = 2;
+      light.range = 8;
 
+      // More intense colors
       vec3.set(light.color,
-        randomBetween(0.1, 1),
-        randomBetween(0.1, 1),
-        randomBetween(0.1, 1)
+        randomBetween(1, 4),
+        randomBetween(1, 4),
+        randomBetween(1, 4)
       );
     }
 
     let lastTimestamp = -1;
     this.frameCallback = (timestamp) => {
+      // Skip desktop rendering when XR session is active
+      if (this.xrSession) return;
+
       const timeDelta = lastTimestamp == -1 ? 0 : timestamp - lastTimestamp;
       lastTimestamp = timestamp;
       this.rafId = requestAnimationFrame(this.frameCallback);
@@ -238,26 +242,31 @@ export class Renderer {
     window.removeEventListener('resize', this.resizeCallback);
   }
 
-  updateWanderingLights(timeDelta) {
+  updateWanderingLights(timeDelta, selectedLightIndex = -1) {
     for (let i = 4; i < this.lightManager.lightCount; ++i) {
+      // Skip selected light
+      if (i === selectedLightIndex) continue;
+
       let light = this.lightManager.lights[i];
 
       light.travelTime -= timeDelta;
 
       if (light.travelTime <= 0) {
-        light.travelTime = randomBetween(500, 2000);
-        light.destination[0] = randomBetween(-11, 10);
-        light.destination[1] = randomBetween(0.2, 6.5);
-        light.destination[2] = randomBetween(-4.5, 4.0);
+        light.travelTime = randomBetween(1000, 4000);
+        // Tighter bounds - stay within main sponza area, above floor
+        light.destination[0] = randomBetween(-5, 5);
+        light.destination[1] = randomBetween(1.0, 4.0);
+        light.destination[2] = randomBetween(-1.5, 1.5);
       }
 
-      light.velocity[0] += (light.destination[0] - light.position[0]) * 0.000005 * timeDelta;
-      light.velocity[1] += (light.destination[1] - light.position[1]) * 0.000005 * timeDelta;
-      light.velocity[2] += (light.destination[2] - light.position[2]) * 0.000005 * timeDelta;
+      // Slower acceleration
+      light.velocity[0] += (light.destination[0] - light.position[0]) * 0.000002 * timeDelta;
+      light.velocity[1] += (light.destination[1] - light.position[1]) * 0.000002 * timeDelta;
+      light.velocity[2] += (light.destination[2] - light.position[2]) * 0.000002 * timeDelta;
 
-      // Clamp the velocity
-      if (vec3.length(light.velocity) > 0.05) {
-        vec3.scale(light.velocity, vec3.normalize(light.velocity, light.velocity), 0.05);
+      // Lower max velocity
+      if (vec3.length(light.velocity) > 0.02) {
+        vec3.scale(light.velocity, vec3.normalize(light.velocity, light.velocity), 0.02);
       }
 
       vec3.add(light.position, light.position, light.velocity);
